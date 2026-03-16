@@ -1,0 +1,35 @@
+#!/bin/bash
+#PBS -l select=1:ncpus=2:mem=32gb:ngpus=1:gpu_model=H200
+#PBS -l walltime=02:00:00
+#PBS -m ae
+#PBS -j oe
+
+# Usage:
+#   - Submit job: qsub score.pbs
+
+cd $PBS_O_WORKDIR
+
+# Load required modules
+module load python/3.11.3
+module load cuda/12.1.1
+module load gcc/12.2.0
+
+source /home/.venv/bin/activate
+
+export CACHE_ROOT=$TMPDIR/cache
+export VLLM_CACHE_ROOT="$CACHE_ROOT/vllm"
+export TORCHINDUCTOR_CACHE_DIR="$CACHE_ROOT/torchinductor"
+export TRITON_CACHE_DIR="$CACHE_ROOT/triton"
+mkdir -p "$VLLM_CACHE_ROOT" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$TMPDIR"
+
+export HF_HUB_ENABLE_HF_TRANSFER=1
+export HF_HOME=$TMPDIR/hf_cache
+mkdir -p $HF_HOME
+
+time python3 process_vllm.py
+
+EXIT_STATUS=$?
+echo "Processing finished with exit status: $EXIT_STATUS"
+
+deactivate
+exit $EXIT_STATUS

@@ -1,0 +1,72 @@
+#!/bin/bash
+#PBS -l select=1:ncpus=1:mem=64gb
+#PBS -l walltime=00:10:00
+#PBS -m ae
+#PBS -j oe
+
+# Usage: qsub merge_lora.pbs
+
+module load python/3.11.3
+module load cuda/12.1.1
+module load gcc/12.2.0
+source /home/.venv/bin/activate
+
+# Define directories
+PERSISTENT_DIR="$PBS_O_WORKDIR"
+LOCAL_WORKSPACE="$TMPDIR/work"
+REPO_URL="https://github.com/xiezhe-24/ChatTS-Training"
+
+###################
+# Configuration
+
+# Base Model Path
+BASE_MODEL_PATH="$PERSISTENT_DIR/exports/ChatTS-8B-Base"
+# LoRA Adapter Path
+LORA_ADAPTER_PATH="$PERSISTENT_DIR/saves/ChatTS-8B-LoRA/checkpoint-100"
+# Output Model Path
+EXPORT_OUTPUT="$PERSISTENT_DIR/exports/ChatTS-8B-SFT"
+
+###################
+
+# Setup Workspace
+echo "Setting up workspace in $LOCAL_WORKSPACE..."
+mkdir -p "$LOCAL_WORKSPACE"
+cd "$LOCAL_WORKSPACE"
+
+if [ ! -d "ChatTS-Training" ]; then
+    echo "Cloning ChatTS-Training repository..."
+    git clone "$REPO_URL"
+fi
+cd ChatTS-Training
+
+echo "Installing LLaMA-Factory in editable mode..."
+pip install -e .
+
+# Validate Model Paths
+if [ ! -d "$BASE_MODEL_PATH" ]; then
+    echo "Error: Base model not found at $BASE_MODEL_PATH"
+    exit 1
+fi
+if [ ! -d "$LORA_ADAPTER_PATH" ]; then
+    echo "Error: LoRA adapter not found at $LORA_ADAPTER_PATH"
+    echo "Please ensure you pointed to a specific 'checkpoint-xxx' folder."
+    exit 1
+fi
+
+# Perform Merge/Export
+echo "Merging LoRA into Base Model..."
+echo "Base:    $BASE_MODEL_PATH"
+echo "Adapter: $LORA_ADAPTER_PATH"
+echo "Output:  $EXPORT_OUTPUT"
+
+llamafactory-cli export \
+    --model_name_or_path "$BASE_MODEL_PATH" \
+    --adapter_name_or_path "$LORA_ADAPTER_PATH" \
+    --template chatts \
+    --finetuning_type lora \
+    --export_dir "$EXPORT_OUTPUT" \
+    --export_size 2 \
+    --export_device cpu \
+    --trust_remote_code True
+
+echo "Job finished. Check $EXPORT_OUTPUT for the merged model."

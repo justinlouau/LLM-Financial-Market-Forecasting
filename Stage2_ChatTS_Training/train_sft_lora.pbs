@@ -1,0 +1,159 @@
+#!/bin/bash
+#PBS -l select=1:ncpus=4:mem=128gb:ngpus=2:gpu_model=H200
+#PBS -l walltime=12:00:00
+#PBS -m ae
+#PBS -j oe
+
+# Usage: qsub train_sft_lora.pbs
+
+cd $PBS_O_WORKDIR
+
+module load python/3.11.3
+module load cuda/12.1.1
+module load gcc/12.2.0
+module load binutils/2.40
+
+source /home/.venv/bin/activate
+
+export LOCAL_WORKSPACE=$TMPDIR/work
+export HF_HOME=$TMPDIR/hf_cache
+
+# Setup output directory for checkpoints
+export OUTPUT_DIR="$PBS_O_WORKDIR/saves/ChatTS-8B-SFT-LoRA"
+
+mkdir -p $LOCAL_WORKSPACE $HF_HOME 
+mkdir -p "$OUTPUT_DIR"
+
+export TRITON_CACHE_DIR=$TMPDIR/triton_cache
+export DEEPSPEED_HOME=$TMPDIR/deepspeed_cache
+mkdir -p $TRITON_CACHE_DIR $DEEPSPEED_HOME
+
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HF_HUB_ENABLE_HF_TRANSFER=1
+
+# Generate DeepSpeed Config (ZeRO-2 + BF16)
+mkdir -p $LOCAL_WORKSPACE/ds_config
+cat <<EOF > $LOCAL_WORKSPACE/ds_config/ds_config_2_bf16.json
+{
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  "gradient_clipping": "auto",
+  "zero_allow_untested_optimizer": true,
+  "bf16": {
+    "enabled": true
+  },
+  "zero_optimization": {
+    "stage": 2,
+    "allgather_partitions": true,
+    "allgather_bucket_size": 5e8,
+    "reduce_scatter": true,
+    "reduce_bucket_size": 5e8,
+    "overlap_comm": false,
+    "contiguous_gradients": true
+  }
+}
+EOF
+
+# Resume Logic: Check for latest checkpoint in OUTPUT_DIR and set --resume_from_checkpoint if found
+LATEST_CKPT=$(ls -d $OUTPUT_DIR/checkpoint-* 2>/dev/null | sort -V | tail -n 1)
+if test -n "$LATEST_CKPT"; then
+    echo "Checkpoint found: $LATEST_CKPT"
+    echo "Resuming training from this checkpoint."
+    RESUME_ARGS="--resume_from_checkpoint $LATEST_CKPT"
+else
+    echo "No valid checkpoints found in $OUTPUT_DIR. Starting fresh."
+    RESUME_ARGS=""
+fi
+
+# Setup Workspace
+echo "Cloning ChatTS-Training repo..."
+cd $LOCAL_WORKSPACE
+git clone https://github.com/xiezhe-24/ChatTS-Training.git codebase
+
+echo "Setting up custom datasets..."
+mkdir -p $LOCAL_WORKSPACE/data
+
+# Copy original dataset_info.json
+cp $LOCAL_WORKSPACE/codebase/data/dataset_info.json $LOCAL_WORKSPACE/data/dataset_info.json
+
+# Copy custom dataset to the workspace
+CUSTOM_DATA_PATH="/srv/scratch/z5218709/thesis/ChatTS-Training/finance_training_set_2.jsonl"
+if [ ! -f "$CUSTOM_DATA_PATH" ]; then
+    echo "CRITICAL ERROR: Custom dataset not found at $CUSTOM_DATA_PATH"
+    exit 1
+fi
+cp "$CUSTOM_DATA_PATH" "$LOCAL_WORKSPACE/data/finance_training_set.jsonl"
+
+# Inject Alpaca mapping for ChatTS keys (input, output, timeseries)
+python -c '
+import json
+
+path = "'$LOCAL_WORKSPACE'/data/dataset_info.json"
+with open(path, "r") as f:
+    info = json.load(f)
+
+# Explicitly map the dataset to the Alpaca format
+info["finance_training"] = {
+    "file_name": "finance_training_set.jsonl",
+    "formatting": "alpaca",
+    "columns": {
+        "prompt": "input",
+        "response": "output",
+        "timeseries": "timeseries"
+    }
+}
+
+with open(path, "w") as f:
+    json.dump(info, f, indent=2)
+'
+
+# Download official ChatTS-8B model from Hugging Face
+MODEL_LOCAL="$LOCAL_WORKSPACE/model_loaded"
+
+echo "Downloading official ChatTS-8B model from Hugging Face..."
+python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='bytedance-research/ChatTS-8B', local_dir='$MODEL_LOCAL')"
+
+echo "Official Base model successfully loaded into $MODEL_LOCAL"
+
+# Run LoRA Fine-Tuning
+cd $LOCAL_WORKSPACE/codebase
+echo "Starting LoRA Fine-Tuning..."
+
+NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 2 --master_port=19901 src/train.py \
+    --deepspeed "$LOCAL_WORKSPACE/ds_config/ds_config_2_bf16.json" \
+    --stage sft \
+    --model_name_or_path "$MODEL_LOCAL" \
+    --dataset "finance_training" \
+    --interleave_probs "1.0" \
+    --mix_strategy "interleave_over" \
+    --do_train \
+    --template "chatts" \
+    --finetuning_type lora \
+    --lora_rank 16 \
+    --lora_target q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+    --additional_target norm \
+    --dataset_dir "$LOCAL_WORKSPACE/data" \
+    --output_dir "$OUTPUT_DIR" \
+    --overwrite_output_dir False \
+    $RESUME_ARGS \
+    --per_device_train_batch_size 4 \
+    --gradient_accumulation_steps 64 \
+    --gradient_checkpointing True \
+    --lr_scheduler_type cosine \
+    --logging_steps 1 \
+    --save_total_limit 1 \
+    --save_steps 100 \
+    --learning_rate 2e-5 \
+    --warmup_ratio 0.02 \
+    --num_train_epochs 3 \
+    --plot_loss \
+    --bf16 True \
+    --save_only_model False \
+    --save_safetensors False \
+    --preprocessing_num_workers 2 \
+    --dataloader_num_workers 2 \
+    --trust_remote_code True \
+    --cutoff_len 10000
+
+echo "Job Finished."

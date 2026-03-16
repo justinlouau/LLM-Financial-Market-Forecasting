@@ -1,0 +1,166 @@
+#!/bin/bash
+#PBS -l select=1:ncpus=4:mem=96gb:ngpus=2:gpu_model=H200
+#PBS -l walltime=02:00:00
+#PBS -M z5218709@ad.unsw.edu.au
+#PBS -m ae
+#PBS -j oe
+
+# Usage: qsub train_stage_4.pbs
+
+cd $PBS_O_WORKDIR
+
+# --- 1. CONFIGURATION & TOGGLES ---
+# Set to 'true' to use the Official Base Model + previous SFT LoRA adapter (for ablation).
+# Set to 'false' to use your Exported (merged) Finetuned Model.
+USE_OFFICIAL_BASE=false
+
+export EXPORTED_MODEL_DIR="$PBS_O_WORKDIR/exports/ChatTS-8B-Official-Finance-LoRA-Merged" # Path to your merged SFT model
+export SFT_DIR="$PBS_O_WORKDIR/saves/ChatTS-8B-LoRA-Finance-1"               # Path to your SFT LoRA adapter (used if USE_OFFICIAL_BASE=true)
+export OUTPUT_DIR="$PBS_O_WORKDIR/saves/ChatTS-8B-LoRA-Finance-DPO"        # Output path for DPO LoRA
+
+# Custom DPO Dataset Path
+export CUSTOM_DPO_PATH="/srv/scratch/z5218709/thesis/ChatTS-Training/dpo_training_data.jsonl"
+
+# --- 2. ENVIRONMENT SETUP ---
+module load python/3.11.3
+module load cuda/12.1.1
+module load gcc/12.2.0
+module load binutils/2.40
+
+source /home/z5218709/.venv/bin/activate
+
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+export NCCL_IB_DISABLE=1
+export OMP_NUM_THREADS=$NCPUS
+
+export LOCAL_WORKSPACE=$TMPDIR/work
+export HF_HOME=$TMPDIR/hf_cache
+
+mkdir -p $LOCAL_WORKSPACE $HF_HOME "$OUTPUT_DIR"
+
+export TRITON_CACHE_DIR="$LOCAL_WORKSPACE/triton_cache"
+mkdir -p "$TRITON_CACHE_DIR"
+
+# Generate DeepSpeed Config (ZeRO-2 + BF16)
+mkdir -p $LOCAL_WORKSPACE/ds_config
+cat <<EOF > $LOCAL_WORKSPACE/ds_config/ds_config_2_bf16.json
+{
+  "train_batch_size": "auto",
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  "zero_allow_untested_optimizer": true,
+  "bf16": { "enabled": true },
+  "zero_optimization": {
+    "stage": 2,
+    "allgather_partitions": true,
+    "allgather_bucket_size": 5e8,
+    "reduce_scatter": true,
+    "reduce_bucket_size": 5e8
+  }
+}
+EOF
+
+# --- 3. PREPARE CODE & DPO DATA (SELF-CONTAINED) ---
+echo "Cloning ChatTS-Training codebase..."
+cd $LOCAL_WORKSPACE
+git clone https://github.com/xiezhe-24/ChatTS-Training.git codebase
+
+mkdir -p $LOCAL_WORKSPACE/data
+cp $LOCAL_WORKSPACE/codebase/data/dataset_info.json $LOCAL_WORKSPACE/data/dataset_info.json
+
+if [ ! -f "$CUSTOM_DPO_PATH" ]; then
+    echo "CRITICAL ERROR: Custom DPO dataset not found at $CUSTOM_DPO_PATH"
+    exit 1
+fi
+cp "$CUSTOM_DPO_PATH" "$LOCAL_WORKSPACE/data/finance_dpo_set.jsonl"
+
+echo "Registering DPO Dataset..."
+python -c '
+import json
+import os
+
+path = os.path.join(os.environ["LOCAL_WORKSPACE"], "data", "dataset_info.json")
+with open(path, "r") as f:
+    info = json.load(f)
+
+# Inject DPO dataset mapping into dataset_info.json
+info["finance_dpo"] = {
+    "file_name": "finance_dpo_set.jsonl",
+    "ranking": True,
+    "formatting": "alpaca",
+    "columns": {
+        "prompt": "input",
+        "chosen": "chosen",
+        "rejected": "rejected",
+        "timeseries": "timeseries"
+    }
+}
+with open(path, "w") as f:
+    json.dump(info, f, indent=2)
+print("Successfully registered finance_dpo in dataset_info.json")
+'
+
+# --- 4. MODEL LOADING LOGIC ---
+if [ "$USE_OFFICIAL_BASE" = true ]; then
+    echo "Ablation Mode: Downloading Official ChatTS-8B Base Model..."
+    MODEL_LOCAL="$LOCAL_WORKSPACE/model_loaded"
+    python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='bytedance-research/ChatTS-8B', local_dir='$MODEL_LOCAL')"
+    
+    BASE_MODEL_PATH="$MODEL_LOCAL"
+    
+    # In this mode, we load the base model, apply the SFT adapter, and tell LLaMA-Factory to create a NEW adapter for DPO
+    ADAPTER_ARGS="--adapter_name_or_path $SFT_DIR --create_new_adapter True"
+    echo "Will load Official Base + SFT Adapter ($SFT_DIR)"
+else
+    echo "Production Mode: Using Exported Finetuned Model..."
+    if [ ! -d "$EXPORTED_MODEL_DIR" ]; then
+        echo "CRITICAL ERROR: Exported model not found at $EXPORTED_MODEL_DIR."
+        echo "Did you run LLaMA-Factory's export_model.py first to merge your SFT LoRA?"
+        exit 1
+    fi
+    BASE_MODEL_PATH="$EXPORTED_MODEL_DIR"
+    
+    # In this mode, the SFT weights are already merged into the base model.
+    # We do NOT pass --adapter_name_or_path. LLaMA-Factory will just initialize a fresh DPO LoRA on top of it.
+    ADAPTER_ARGS=""
+    echo "Will load Merged Model ($BASE_MODEL_PATH) and train a fresh DPO LoRA on top."
+fi
+
+# --- 5. RUN DPO TRAINING ---
+cd $LOCAL_WORKSPACE/codebase
+echo "Starting DPO Fine-Tuning..."
+
+# Notice the $ADAPTER_ARGS injection which dynamically adds the adapter flags if needed
+NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 2 src/train.py \
+    --deepspeed "$LOCAL_WORKSPACE/ds_config/ds_config_2_bf16.json" \
+    --stage dpo \
+    --model_name_or_path "$BASE_MODEL_PATH" \
+    $ADAPTER_ARGS \
+    --dataset "finance_dpo" \
+    --interleave_probs "1.0" \
+    --mix_strategy "interleave_over" \
+    --do_train \
+    --template "chatts" \
+    --finetuning_type lora \
+    --lora_rank 8 \
+    --lora_target q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
+    --additional_target norm \
+    --dataset_dir "$LOCAL_WORKSPACE/data" \
+    --output_dir "$OUTPUT_DIR" \
+    --per_device_train_batch_size 2 \
+    --gradient_accumulation_steps 32 \
+    --gradient_checkpointing True \
+    --lr_scheduler_type cosine \
+    --logging_steps 1 \
+    --save_total_limit 1 \
+    --save_steps 10 \
+    --learning_rate 5e-6 \
+    --warmup_ratio 0.1 \
+    --num_train_epochs 1 \
+    --pref_beta 0.1 \
+    --plot_loss \
+    --bf16 True \
+    --trust_remote_code True \
+    --cutoff_len 8192
+
+echo "Job Finished."
