@@ -12,27 +12,27 @@ This repository provides source code for the thesis *Leveraging Time Series Mult
 
 This repository is grouped into multiple steps and stages. Detailed instructions are available inside each individual folder.
 
-<u>Stage 1: Data Pipeline and Dataset Creation</u>
+**Stage 1: Data Pipeline and Dataset Creation**
 
-- **Stage1_Data_Pipeline**: This is a pipeline which retrieves S&P 500 stock data, financial reports, and news data as the foundational data for training and evaluation.
-- **Stage1_SFT_Dataset_Creation**: This contains the source code used to create our Supervised Fine Tuning (SFT) Dataset.
-- **Stage1_RL_Dataset_Creation**: This contains the source code used to create our Reinforcement Learning (RL) Dataset.
+- Stage1_Data_Pipeline: This is a pipeline which retrieves S&P 500 stock data, financial reports, and news data as the foundational data for training and evaluation.
+- Stage1_SFT_Dataset_Creation: This contains the source code used to create our Supervised Fine Tuning (SFT) Dataset.
+- Stage1_RL_Dataset_Creation: This contains the source code used to create our Reinforcement Learning (RL) Dataset.
 
-<u>Stage 2: Training</u>
+**Stage 2: Training**
 
-- **Stage2_ChatTS_Training**: This contains the source code used to train the SFT and RL stages of the model.
+- Stage2_ChatTS_Training: This contains the source code used to train the SFT and RL stages of the model.
 
-<u>Stage 3: Benchmark</u>
+**Stage 3: Benchmark**
 
-- **Stage3_Forecast_Benchmark**: This contains the source code used to benchmark our model.
+- Stage3_Forecast_Benchmark: This contains the source code used to benchmark our model.
 
-<u>Stage 4: Evaluation</u>
+**Stage 4: Evaluation**
 
-- **Stage4_Forecast_Evaluation**: This contains the source code used to evaluate our model.
+- Stage4_Forecast_Evaluation: This contains the source code used to evaluate our model.
 
-<u>Miscellaneous</u>
+**Miscellaneous**
 
-- **FinArena_Benchmark**: This contains the benchmark code used in our research proposal.
+- FinArena_Benchmark: This contains the benchmark code used in our research proposal.
 
 ## Contact
 
