@@ -5,8 +5,8 @@ This repository provides source code for the thesis *Leveraging Time Series Mult
 ## System Requirements
 
 - This research was performed on the [UNSW Katana High Performance Computing Cluster](https://docs.restech.unsw.edu.au/). For our implementation, we used 2x H200s for model training and 1x H200 for inference/benchmarking tasks.
-- Python scripts with an associated `.pbs` are intended to be run on Katana or another HPC Cluster. See HPC_Setup.md for more information.
-- Python scripts without an associated `.pbs` file can be run on workstations using [pdm package manager](https://pdm-project.org/en/latest/). Begin by installing `pdm` and running `pdm install`, then following the folder specific instructions.
+- Python scripts with an associated `.pbs` are intended to be run on Katana or another HPC Cluster. See [HPC_Setup.md](https://github.com/justinlouau/LLM-Financial-Market-Forecasting/blob/main/HPC_Setup.md) for more information.
+- Python scripts without an associated `.pbs` file can be run on workstations using [pdm package manager](https://pdm-project.org/en/latest/). Begin by installing pdm and running `pdm install`, then following the folder specific instructions.
 
 ## Getting Started
 
