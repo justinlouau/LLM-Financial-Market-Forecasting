@@ -3,31 +3,36 @@ import os
 import argparse
 from pathlib import Path
 
-def extract_json_from_text(text):
+def extract_jsons_from_text(text):
     """
-    Attempts to find the largest outer JSON object enclosed in {} 
+    Attempts to find all valid JSON objects enclosed in {} 
     within a string containing other text.
+    Returns a list of parsed JSON objects.
     """
+    # 1. Try parsing the whole text first 
     try:
-        # 1. Try parsing the whole text first (fast path for pure JSON)
-        return json.loads(text)
+        return [json.loads(text)]
     except json.JSONDecodeError:
         pass
 
-    # 2. Fallback to extracting content between the first { and the last }
-    start_index = text.find('{')
-    end_index = text.rfind('}')
-
-    if start_index != -1 and end_index != -1 and end_index > start_index:
-        # Extract the content from the first { to the last }
-        json_candidate = text[start_index : end_index + 1]
+    # 2. Extract all JSON candidates using JSONDecoder
+    jsons =[]
+    decoder = json.JSONDecoder()
+    idx = 0
+    while idx < len(text):
+        idx = text.find('{', idx)
+        if idx == -1:
+            break
         try:
-            return json.loads(json_candidate)
-        except json.JSONDecodeError as e:
-            # Re-raise with specific context if extraction failed to produce valid JSON
-            raise ValueError(f"Extracted content is not valid JSON: {e}")
-    else:
-        raise ValueError("No JSON brackets '{}' found in text.")
+            result, index = decoder.raw_decode(text[idx:])
+            jsons.append(result)
+            # Move the index forward by the length of the parsed JSON
+            idx += index
+        except json.JSONDecodeError:
+            # If the bracket wasn't a valid JSON start, move forward by 1
+            idx += 1
+            
+    return jsons
 
 def process_json_folder(input_folder_path):
     input_path = Path(input_folder_path)
@@ -56,7 +61,7 @@ def process_json_folder(input_folder_path):
     # Look for *.txt files
     for file_path in input_path.glob('*.txt'):
         
-        # 1. IDENTIFY THE GROUP (Ticker + Date)
+        # 1. Identify Metadata (Ticker + Date)
         filename_stem = file_path.stem # Filename without extension
         
         if "_data_run_" in filename_stem:
@@ -67,81 +72,86 @@ def process_json_folder(input_folder_path):
         if group_id not in group_tracker:
             group_tracker[group_id] = False
 
-        # 2. PROCESS JSON
+        # 2. Process Data
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 raw_content = f.read()
 
-            # Extract JSON from mixed text
-            data = extract_json_from_text(raw_content)
+            # Extract all potential JSON blocks from mixed text
+            candidate_jsons = extract_jsons_from_text(raw_content)
 
+            valid_data = None
+            error_msg = "No JSON brackets '{}' found or no valid JSON block parsed."
 
-            # Perform schema validation on the extracted JSON
-            if not isinstance(data, dict):
-                print(f"[SKIP] Invalid format in {file_path.name}: not a dict")
-                invalid_files_count += 1
-                continue
-            if 'chain_of_thought' not in data or not isinstance(data['chain_of_thought'], str):
-                print(f"[SKIP] Invalid format in {file_path.name}: missing or invalid 'chain_of_thought'")
-                invalid_files_count += 1
-                continue
-            if 'output' not in data or not isinstance(data['output'], dict):
-                print(f"[SKIP] Invalid format in {file_path.name}: missing or invalid 'output' key")
-                invalid_files_count += 1
-                continue
+            # Iterate through all extracted JSONs backwards to get last valid JSON
+            for data in reversed(candidate_jsons):
+                if not isinstance(data, dict):
+                    error_msg = "Extracted JSON is not a dict"
+                    continue
+                
+                # Wrap JSON if needed
+                if 'chain_of_thought' not in data and 'output' not in data:
+                    if 'next_day_direction' in data and 'next_day_closing_price' in data:
+                        data = {
+                            "chain_of_thought": raw_content.strip(),
+                            "output": data
+                        }
 
-            # Check required output fields
-            output = data['output']
-            if 'next_day_direction' not in output or not isinstance(output['next_day_direction'], int):
-                print(f"[SKIP] Invalid format in {file_path.name}: missing or invalid 'next_day_direction' in 'output'")
-                invalid_files_count += 1
-                continue
-            if 'next_day_closing_price' not in output or not (isinstance(output['next_day_closing_price'], float) or isinstance(output['next_day_closing_price'], int)):
-                print(f"[SKIP] Invalid format in {file_path.name}: missing or invalid 'next_day_closing_price' in 'output'")
-                invalid_files_count += 1
-                continue
-            if 'forecast' not in output or not isinstance(output['forecast'], dict):
-                print(f"[SKIP] Invalid format in {file_path.name}: missing or invalid 'forecast' in 'output'")
-                invalid_files_count += 1
-                continue
-            forecast = output['forecast']
-            for key in ['up', 'down', 'unchanged']:
-                if key not in forecast or not (isinstance(forecast[key], float) or isinstance(forecast[key], int)):
-                    print(f"[SKIP] Invalid format in {file_path.name}: missing or invalid '{key}' in 'forecast'")
-                    invalid_files_count += 1
-                    break
-            else:
+                # Perform schema validation on the candidate
+                if 'chain_of_thought' not in data or not isinstance(data['chain_of_thought'], str):
+                    error_msg = "missing or invalid 'chain_of_thought'"
+                    continue
+                if 'output' not in data or not isinstance(data['output'], dict):
+                    error_msg = "missing or invalid 'output' key"
+                    continue
+
+                # Check required output fields
+                output = data['output']
+                if 'next_day_direction' not in output or not isinstance(output['next_day_direction'], int):
+                    error_msg = "missing or invalid 'next_day_direction' in 'output'"
+                    continue
+                if 'next_day_closing_price' not in output or not isinstance(output['next_day_closing_price'], (float, int)):
+                    error_msg = "missing or invalid 'next_day_closing_price' in 'output'"
+                    continue
+                if 'forecast' not in output or not isinstance(output['forecast'], dict):
+                    error_msg = "missing or invalid 'forecast' in 'output'"
+                    continue
+                    
+                forecast = output['forecast']
+                valid_forecast = True
+                
+                for key in ['up', 'down', 'unchanged']:
+                    if key not in forecast or not isinstance(forecast[key], (float, int)):
+                        error_msg = f"missing or invalid '{key}' in 'forecast'"
+                        valid_forecast = False
+                        break
+                
+                # If all checks passed, we found our valid JSON! Stop looking.
+                if valid_forecast:
+                    valid_data = data
+                    break 
+
+            if valid_data is not None:
                 # Save as .json
                 output_filename = file_path.with_suffix('.json').name
                 output_file_path = output_path / output_filename
 
                 with open(output_file_path, 'w', encoding='utf-8') as f_out:
-                    json.dump(data, f_out, indent=4, ensure_ascii=False)
+                    json.dump(valid_data, f_out, indent=4, ensure_ascii=False)
                 print(f"[OK] {file_path.name} -> {output_filename}")
                 valid_files_count += 1
                 group_tracker[group_id] = True
-                continue
+            else:
+                # No candidates matched the schema
+                print(f"[SKIP] Invalid format in {file_path.name}: {error_msg}")
+                invalid_files_count += 1
 
-            # Save as .json
-            output_filename = file_path.with_suffix('.json').name
-            output_file_path = output_path / output_filename
-
-            with open(output_file_path, 'w', encoding='utf-8') as f_out:
-                json.dump(data, f_out, indent=4, ensure_ascii=False)
-            print(f"[OK] {file_path.name} -> {output_filename}")
-            valid_files_count += 1
-            group_tracker[group_id] = True
-
-        except (json.JSONDecodeError, ValueError) as e:
-            print(f"[SKIP] Invalid JSON in {file_path.name}: {e}")
-            invalid_files_count += 1
-            
         except Exception as e:
             print(f"[ERROR] Could not process {file_path.name}: {e}")
             invalid_files_count += 1
 
     # Calculate stats
-    failed_groups = [gid for gid, success in group_tracker.items() if not success]
+    failed_groups =[gid for gid, success in group_tracker.items() if not success]
     
     print("-" * 30)
     print(f"Processing Complete.")
