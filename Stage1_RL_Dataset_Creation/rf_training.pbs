@@ -1,11 +1,8 @@
 #!/bin/bash
-#PBS -l select=1:ncpus=4:mem=64gb:ngpus=1:gpu_model=H200
+#PBS -l select=1:ncpus=4:mem=48gb:ngpus=2:gpu_model=H200
 #PBS -l walltime=12:00:00
 #PBS -m ae
 #PBS -j oe
-
-# Usage:
-#   - Submit job: qsub rf_training.pbs
 
 cd $PBS_O_WORKDIR
 
@@ -14,25 +11,43 @@ module load python/3.11.3
 module load cuda/12.8.0
 module load gcc/12.2.0
 
-source /home/.venv/bin/activate
-
-# Define the cache path in your temporary directory
-CACHE_DIR=$TMPDIR/hf_cache
-mkdir -p $CACHE_DIR 
+source /home/venv/bin/activate
 
 export HF_HUB_ENABLE_HF_TRANSFER=1
-export HF_HOME=$CACHE_DIR
-export HUGGINGFACE_HUB_CACHE=$CACHE_DIR
-export TRANSFORMERS_CACHE=$CACHE_DIR
+export PYTHONUNBUFFERED=2 
+NUM_SHARDS=2
 
-TRITON_CACHE_DIR=$TMPDIR/triton_cache
-mkdir -p $TRITON_CACHE_DIR
-export TRITON_CACHE_DIR=$TRITON_CACHE_DIR
- 
-time python3 rl_training.py
+# Prevent thread contention between the 3 processes
+export OMP_NUM_THREADS=2
+export TOKENIZERS_PARALLELISM=false 
 
-EXIT_STATUS=$?
-echo "Processing finished with exit status: $EXIT_STATUS"
+echo "Starting Multi-GPU DPO Generation across $NUM_SHARDS GPUs..."
 
+# PBS provides the assigned GPUs in a comma-separated list (e.g., "1,2,3"). 
+IFS=',' read -r -a GPU_ARRAY <<< "${CUDA_VISIBLE_DEVICES:-0,1,2}"
+
+# Loop from 0 to 2 (Total of 3 shards)
+for i in $(seq 0 $((NUM_SHARDS-1))); do
+    PHYSICAL_GPU=${GPU_ARRAY[$i]}
+    echo "Starting Shard $i on assigned physical GPU $PHYSICAL_GPU..."
+    
+    SHARD_CACHE=$TMPDIR/cache_$i
+    mkdir -p $SHARD_CACHE/hf $SHARD_CACHE/triton
+    
+    export HF_HOME=$SHARD_CACHE/hf
+    export HUGGINGFACE_HUB_CACHE=$SHARD_CACHE/hf
+    export TRANSFORMERS_CACHE=$SHARD_CACHE/hf
+    export TRITON_CACHE_DIR=$SHARD_CACHE/triton
+    
+    # Assign the correct physical GPU, Python will see it as "cuda:0"
+    CUDA_VISIBLE_DEVICES=$PHYSICAL_GPU python3 rl_training.py \
+        --shard-id $i \
+        --num-shards $NUM_SHARDS \
+        > shard_${i}.log 2>&1 &
+done
+
+wait
+
+echo "All $NUM_SHARDS GPUs have finished processing."
 deactivate
-exit $EXIT_STATUS
+exit 0

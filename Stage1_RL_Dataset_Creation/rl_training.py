@@ -3,8 +3,10 @@ import json
 import torch
 import gc
 import traceback
+import argparse
 from transformers import (
     AutoModelForCausalLM,
+    AutoTokenizer,
     AutoProcessor,
 )
 import numpy as np 
@@ -15,7 +17,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 # Configuration
 MODELS_TO_BENCHMARK =[
-    ("ChatTS-8B-Model-Name", "/srv/scratch/model_path"),
+    ("ChatTS-8B-SFT", "/srv/scratch/thesis/ChatTS-Training/exports/ChatTS-8B-SFT"),
 ]
 
 INPUT_DIR = "output_filtered"
@@ -27,7 +29,14 @@ MAX_INPUT_TOKENS = 32768
 
 BATCH_SIZE = 8
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run DPO Generation with Sharding")
+    parser.add_argument("--shard-id", type=int, default=0, help="Index of the current shard (0 to num_shards-1)")
+    parser.add_argument("--num-shards", type=int, default=1, help="Total number of shards/GPUs")
+    return parser.parse_args()
+
 def create_prompt(financial_data: dict, ts_stats: dict) -> str:
+    # OPTIMIZATION 1: Minify JSON to drastically reduce token count & KV Cache memory
     financial_document_str = json.dumps(financial_data, separators=(',', ':'))
 
     stats_str = "\n".join([
@@ -68,9 +77,9 @@ Here are the stock OHLCV time series (Open, High, Low, Close, Volume): <ts><ts/>
 
 def preload_data(pending_files):
     print("Pre-loading and processing dataset into RAM...")
-    dataset =[]
+    dataset = []
     
-    ts_keys = ['open', 'high', 'low', 'close', 'volume']
+    ts_keys =['open', 'high', 'low', 'close', 'volume']
     
     for filename in pending_files:
         try:
@@ -86,7 +95,7 @@ def preload_data(pending_files):
             ts_stats = {} 
             
             for k in ts_keys:
-                vals = time_series_data.get(k,[])
+                vals = time_series_data.get(k, [])
                 if len(vals) > MAX_TS_POINTS:
                     vals = vals[-MAX_TS_POINTS:]
                 
@@ -107,7 +116,7 @@ def preload_data(pending_files):
             dataset.append({
                 "filename": filename,
                 "prompt": prompt,
-                "prompt_length": len(prompt), # Added for sorting logic
+                "prompt_length": len(prompt),
                 "ts": ts_tensors,
                 "raw_ts": raw_ts_lists
             })
@@ -115,17 +124,17 @@ def preload_data(pending_files):
         except Exception as e:
             print(f"[ERROR] Reading {filename}: {e}")
             
-    # Sort dataset by prompt length to optimize batch processing and minimize padding
+    # Sort by prompt string length instead of raw file size to reduce padding
     dataset.sort(key=lambda x: x["prompt_length"])
     
     print(f"Successfully pre-loaded {len(dataset)} items.")
     return dataset
 
-def evaluate_model(model_name, model_path):
+def evaluate_model(model_name, model_path, shard_id, num_shards):
     current_output_dir = os.path.join(BASE_OUTPUT_DIR, model_name)
     os.makedirs(current_output_dir, exist_ok=True)
 
-    print(f"\n{'='*60}\nStarting Evaluation for: {model_name}\n{'='*60}")
+    print(f"\n{'='*60}\nStarting Evaluation for: {model_name} (Shard {shard_id+1}/{num_shards})\n{'='*60}")
 
     chosen_dtype = torch.bfloat16
     chosen_attn = "flash_attention_2"
@@ -136,7 +145,7 @@ def evaluate_model(model_name, model_path):
         if getattr(processor.tokenizer, "pad_token", None) is None:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
         
-        eos_token_ids =[processor.tokenizer.eos_token_id]
+        eos_token_ids = [processor.tokenizer.eos_token_id]
         try:
             im_end_id = processor.tokenizer.encode("<|im_end|>", add_special_tokens=False)
             if isinstance(im_end_id, list):
@@ -156,17 +165,22 @@ def evaluate_model(model_name, model_path):
         )
         model.eval()
         
-        torch._dynamo.config.suppress_errors = True
-        model = torch.compile(model, mode="reduce-overhead")
-        
     except Exception as e:
         print(f"[ERROR] Failed to load model {model_name}: {e}")
         return
 
+    # SHARDING LOGIC
+    # 1. Get ALL files and sort them deterministically so every worker sees the same list
     all_files =[f for f in os.listdir(INPUT_DIR) if f.endswith('.json')]
-    pending_files =[f for f in all_files if not os.path.exists(os.path.join(current_output_dir, f))]
+    all_files.sort() 
+
+    # 2. Divide files evenly based on modulo arithmetic
+    sharded_files =[f for i, f in enumerate(all_files) if i % num_shards == shard_id]
+    
+    # 3. Filter out files that have already been generated (for resumption)
+    pending_files =[f for f in sharded_files if not os.path.exists(os.path.join(current_output_dir, f))]
             
-    # Pre-load data
+    # Pre-load data for this specific GPU's shard
     dataset = preload_data(pending_files)
     total_files = len(dataset)
 
@@ -181,11 +195,11 @@ def evaluate_model(model_name, model_path):
         valid_filenames = [item["filename"] for item in batch_items]
         batch_prompts = [item["prompt"] for item in batch_items]
         
-        batch_ts = []
+        batch_ts =[]
         for item in batch_items:
             batch_ts.extend(item["ts"])
 
-        print(f"Processing batch[{i+1} to {min(i+current_batch_size, total_files)}] / {total_files} (Batch Size: {current_batch_size})...")
+        print(f"[Shard {shard_id}] Processing batch[{i+1} to {min(i+current_batch_size, total_files)}] / {total_files} (Batch Size: {current_batch_size})...")
 
         try:
             with torch.inference_mode():
@@ -238,7 +252,7 @@ def evaluate_model(model_name, model_path):
                     processed_files += 1
                     progress_counter += 1
                     if progress_counter >= 100 or processed_files == total_files:
-                        print(f"Progress: {processed_files} / {total_files} files processed.")
+                        print(f"[Shard {shard_id}] Progress: {processed_files} / {total_files} files processed.")
                         progress_counter = 0
 
                 del inputs, output_ids
@@ -246,31 +260,38 @@ def evaluate_model(model_name, model_path):
             i += current_batch_size
 
         except torch.cuda.OutOfMemoryError:
-            print(f"[WARN] OOM Error encountered. Halving batch size from {current_batch_size} to {max(1, current_batch_size // 2)} and retrying.")
+            print(f"[WARN] Shard {shard_id} OOM Error. Halving batch size from {current_batch_size} to {max(1, current_batch_size // 2)} and retrying.", flush=True)
+            
+            if 'inputs' in locals():
+                del inputs
+            if 'output_ids' in locals():
+                del output_ids
+            gc.collect()
             torch.cuda.empty_cache()
+            
             if current_batch_size == 1:
-                print(f"[ERROR] Cannot process sequence even with batch size 1. Skipping {valid_filenames[0]}.")
+                print(f"  [ERROR] Cannot process sequence even with batch size 1. Skipping {valid_filenames[0]}.", flush=True)
                 i += 1
             else:
                 current_batch_size = max(1, current_batch_size // 2)
                 
         except Exception as e:
-            print(f"[ERROR] Inference failed for batch starting with {valid_filenames[0]}")
+            print(f"  [ERROR] Inference failed for batch starting with {valid_filenames[0]}")
             traceback.print_exc()
             i += current_batch_size
 
-    # Cleanup
     del model
     del processor
     gc.collect()
     torch.cuda.empty_cache()
-    print(f"Finished evaluation for {model_name}.\n")
+    print(f"Finished evaluation for {model_name} on Shard {shard_id}.\n")
 
 def main():
-    print("Starting ChatTS-8B DPO Generation Suite")
+    args = parse_args()
+    print(f"--- Starting ChatTS-8B DPO Generation Suite (Shard {args.shard_id+1}/{args.num_shards}) ---")
     for name, path in MODELS_TO_BENCHMARK:
-        evaluate_model(name, path)
-    print("DPO Generation Suite Finished")
+        evaluate_model(name, path, args.shard_id, args.num_shards)
+    print(f"--- DPO Generation Suite Finished for Shard {args.shard_id+1} ---")
 
 if __name__ == "__main__":
     main()

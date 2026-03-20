@@ -142,7 +142,7 @@ NCCL_DEBUG=WARN DEEPSPEED_TIMEOUT=120 deepspeed --num_gpus 2 src/train.py \
     --do_train \
     --template "chatts" \
     --finetuning_type lora \
-    --lora_rank 8 \
+    --lora_rank 16 \
     --lora_target q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
     --additional_target norm \
     --dataset_dir "$LOCAL_WORKSPACE/data" \
